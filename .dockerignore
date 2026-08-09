@@ -1,0 +1,13 @@
+.git
+.gitignore
+.venv
+venv
+__pycache__
+**/__pycache__
+*.pyc
+.env
+out/
+infra/
+scripts/
+README.md
+.claude/settings.local.json

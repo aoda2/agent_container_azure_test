@@ -1,0 +1,4 @@
+# The wheel bundles a platform-specific Claude Code binary (~290 MB), so the
+# image must be built for the same architecture it will run on (linux/amd64
+# for Azure Container Apps by default).
+claude-agent-sdk==0.2.134

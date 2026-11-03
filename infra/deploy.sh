@@ -97,6 +97,8 @@ JOB_ENV_VARS=(
 if [[ "${TASK}" == "code-review" || "${TASK}" == "explain-code" ]]; then
   JOB_ENV_VARS+=("TARGET_REPO_URL=${TARGET_REPO_URL}" "BASE_REF=${BASE_REF}" "HEAD_REF=${HEAD_REF}")
 fi
+[[ -n "${OTEL_CAPTURE:-}" ]] && JOB_ENV_VARS+=("OTEL_CAPTURE=${OTEL_CAPTURE}")
+[[ -n "${OTEL_LOG_USER_PROMPTS:-}" ]] && JOB_ENV_VARS+=("OTEL_LOG_USER_PROMPTS=${OTEL_LOG_USER_PROMPTS}")
 [[ -n "${MODEL}" ]] && JOB_ENV_VARS+=("MODEL=${MODEL}")
 [[ -n "${MAX_TURNS}" ]] && JOB_ENV_VARS+=("MAX_TURNS=${MAX_TURNS}")
 

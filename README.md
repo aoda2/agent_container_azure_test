@@ -204,6 +204,8 @@ ACR Basic の固定費があるので、試し終わったら実行してくだ�
 | `RUN_ID` | 実行時刻 | 複数実行の結果を Blob 上でグループ化する識別子（モデル比較で使用） |
 | `STORAGE_CONNECTION_STRING` | – | Azure Storage 接続文字列。`BLOB_CONTAINER` と併せて設定するとレポートをアップロード |
 | `BLOB_CONTAINER` | – | アップロード先の Blob コンテナ名 |
+| `OTEL_CAPTURE` | – | `1` で Claude Code の OpenTelemetry ログ/メトリクスを取得し、`{RUN_ID}/{MODEL}/{TASK}/otel-*.jsonl` に OTLP JSON（1 行 1 リクエスト）としてアップロード。Collector 不要（プロセス内の受信機を使用） |
+| `OTEL_LOG_USER_PROMPTS` | – | `1` でイベントにプロンプト本文も含める（機密情報が Blob に残る点に注意） |
 
 `code-review` / `explain-code` のみ:
 

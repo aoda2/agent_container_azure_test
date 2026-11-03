@@ -46,6 +46,8 @@ fi
 [[ -n "${MAX_TURNS:-}" ]] && RUN_ARGS+=(-e "MAX_TURNS=${MAX_TURNS}")
 [[ -n "${STORAGE_CONNECTION_STRING:-}" ]] && RUN_ARGS+=(-e "STORAGE_CONNECTION_STRING=${STORAGE_CONNECTION_STRING}")
 [[ -n "${BLOB_CONTAINER:-}" ]] && RUN_ARGS+=(-e "BLOB_CONTAINER=${BLOB_CONTAINER}")
+[[ -n "${OTEL_CAPTURE:-}" ]] && RUN_ARGS+=(-e "OTEL_CAPTURE=${OTEL_CAPTURE}")
+[[ -n "${OTEL_LOG_USER_PROMPTS:-}" ]] && RUN_ARGS+=(-e "OTEL_LOG_USER_PROMPTS=${OTEL_LOG_USER_PROMPTS}")
 [[ -n "${RUN_ID:-}" ]] && RUN_ARGS+=(-e "RUN_ID=${RUN_ID}")
 
 echo "==> running task=${TASK}"

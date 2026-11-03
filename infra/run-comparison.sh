@@ -26,6 +26,9 @@ for model in "${MODEL_LIST[@]}"; do
   # stored config (ANTHROPIC_API_KEY, STORAGE_CONNECTION_STRING) must be
   # repeated here or the run fails with "ANTHROPIC_API_KEY is not set".
   OVERRIDE_ENV="TASK=explain-code MODEL=${model} RUN_ID=${RUN_ID} TARGET_REPO_URL=${TARGET_REPO_URL} BASE_REF=${BASE_REF} HEAD_REF=${HEAD_REF} ANTHROPIC_API_KEY=secretref:anthropic-api-key STORAGE_CONNECTION_STRING=secretref:storage-connection-string BLOB_CONTAINER=${BLOB_CONTAINER}"
+  # `--env-vars` also drops OTEL_CAPTURE etc. unless repeated here.
+  [[ -n "${OTEL_CAPTURE:-}" ]] && OVERRIDE_ENV+=" OTEL_CAPTURE=${OTEL_CAPTURE}"
+  [[ -n "${OTEL_LOG_USER_PROMPTS:-}" ]] && OVERRIDE_ENV+=" OTEL_LOG_USER_PROMPTS=${OTEL_LOG_USER_PROMPTS}"
   # shellcheck disable=SC2206
   OVERRIDES=(${OVERRIDE_ENV})
   echo "==> starting ${JOB_NAME} (model=${model})"

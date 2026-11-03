@@ -19,6 +19,8 @@ START_ARGS=(--name "${JOB_NAME}" --resource-group "${RESOURCE_GROUP}")
 # --env-vars) is set, even though the image itself does not change.
 if [[ -n "${OVERRIDE_ENV:-}" ]]; then
   BASE_ENV="ANTHROPIC_API_KEY=secretref:anthropic-api-key STORAGE_CONNECTION_STRING=secretref:storage-connection-string BLOB_CONTAINER=${BLOB_CONTAINER} TASK=${TASK}"
+  [[ -n "${OTEL_CAPTURE:-}" ]] && BASE_ENV+=" OTEL_CAPTURE=${OTEL_CAPTURE}"
+  [[ -n "${OTEL_LOG_USER_PROMPTS:-}" ]] && BASE_ENV+=" OTEL_LOG_USER_PROMPTS=${OTEL_LOG_USER_PROMPTS}"
   # shellcheck disable=SC2206
   ALL_ENTRIES=(${BASE_ENV} ${OVERRIDE_ENV})
 

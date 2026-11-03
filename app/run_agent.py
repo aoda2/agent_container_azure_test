@@ -27,6 +27,10 @@ STORAGE_CONNECTION_STRING  Azure Storage connection string. If set together
                         with BLOB_CONTAINER, the report is also uploaded to
                         blob storage at {RUN_ID}/{MODEL}/{TASK}/report-*.md.
 BLOB_CONTAINER          Blob container name for the upload above.
+OTEL_CAPTURE            Set to 1 to capture Claude Code's OpenTelemetry logs and
+                        metrics (OTLP/HTTP JSON) via an in-process receiver and
+                        upload them as otel-*.jsonl next to the report.
+OTEL_LOG_USER_PROMPTS   Set to 1 to include prompt text in captured events.
 
 code-review and explain-code only:
 TARGET_REPO_URL     Git URL to clone. If unset, WORKSPACE_DIR is reviewed as-is.
@@ -41,12 +45,18 @@ WORKSPACE_DIR       Where the repo lives.          Default: /workspace/repo
 from __future__ import annotations
 
 import asyncio
+import gzip
+import json
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
+import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
@@ -246,9 +256,88 @@ def resolved_model(task: Task) -> str:
     return os.environ.get("MODEL", "").strip() or task.model
 
 
-async def run_task(task: Task, cwd: Path, prompt: str) -> str:
+class OtelCapture:
+    """Minimal in-process OTLP/HTTP receiver that appends payloads to a JSONL file.
+
+    Claude Code is pointed at it with OTEL_EXPORTER_OTLP_PROTOCOL=http/json, so
+    each POST body (/v1/logs, /v1/metrics, /v1/traces) is already standard OTLP
+    JSON. One line per request: {"path": ..., "received_at": ..., "body": ...}.
+    No Collector is needed, and nothing touches the CLI's stdout (which the SDK
+    uses for its own protocol, so the `console` exporter is not an option).
+    """
+
+    def __init__(self) -> None:
+        handle, name = tempfile.mkstemp(prefix="otel-", suffix=".jsonl")
+        os.close(handle)
+        self.path = Path(name)
+        self._lock = threading.Lock()
+        capture = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802 - http.server API
+                raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                if self.headers.get("Content-Encoding") == "gzip":
+                    raw = gzip.decompress(raw)
+                capture.write(self.path, raw)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *args: object) -> None:  # silence access log
+                pass
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.endpoint = f"http://127.0.0.1:{self._server.server_address[1]}"
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+
+    def write(self, request_path: str, raw: bytes) -> None:
+        try:
+            body = json.loads(raw)
+        except ValueError:
+            body = raw.decode("utf-8", errors="replace")
+        record = {
+            "path": request_path,
+            "received_at": datetime.now(timezone.utc).isoformat(),
+            "body": body,
+        }
+        with self._lock, self.path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def env(self) -> dict[str, str]:
+        """Environment for the Claude Code CLI subprocess."""
+        env = {
+            "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+            "OTEL_LOGS_EXPORTER": "otlp",
+            "OTEL_METRICS_EXPORTER": "otlp",
+            "OTEL_EXPORTER_OTLP_PROTOCOL": "http/json",
+            "OTEL_EXPORTER_OTLP_ENDPOINT": self.endpoint,
+            # Short intervals: the job is short-lived, so don't wait for the defaults.
+            "OTEL_LOGS_EXPORT_INTERVAL": "1000",
+            "OTEL_METRIC_EXPORT_INTERVAL": "5000",
+        }
+        if os.environ.get("OTEL_LOG_USER_PROMPTS", "").strip():
+            env["OTEL_LOG_USER_PROMPTS"] = os.environ["OTEL_LOG_USER_PROMPTS"].strip()
+        return env
+
+    def close(self) -> None:
+        time.sleep(2)  # let the CLI's final flush land
+        self._server.shutdown()
+        self._server.server_close()
+
+
+def start_otel_capture() -> OtelCapture | None:
+    if os.environ.get("OTEL_CAPTURE", "").strip() not in ("1", "true", "True"):
+        return None
+    capture = OtelCapture()
+    log(f"[otel] capturing OTLP to {capture.path} via {capture.endpoint}")
+    return capture
+
+
+async def run_task(task: Task, cwd: Path, prompt: str, otel_env: dict[str, str] | None = None) -> str:
     """Drive the agent and return the report text."""
     options = ClaudeAgentOptions(
+        env=otel_env or {},
         cwd=str(cwd),
         system_prompt=SYSTEM_PROMPT,
         setting_sources=setting_sources(),
@@ -305,8 +394,8 @@ async def run_task(task: Task, cwd: Path, prompt: str) -> str:
     return (result_text or (transcript[-1] if transcript else "")).strip()
 
 
-def upload_report(report: str, task_name: str, task: Task, stamp: str) -> None:
-    """Upload the report to blob storage, when configured.
+def upload_blob_text(data: str | bytes, name: str, task_name: str, task: Task, stamp: str) -> None:
+    """Upload `data` as {RUN_ID}/{MODEL}/{TASK}/{name}-{stamp}{ext}, when configured.
 
     Optional: a comparison run across models should still have its other
     results even if one upload fails, so this logs a warning and returns
@@ -319,16 +408,31 @@ def upload_report(report: str, task_name: str, task: Task, stamp: str) -> None:
 
     run_id = os.environ.get("RUN_ID", "").strip() or stamp
     model = resolved_model(task)
-    blob_path = f"{run_id}/{model}/{task_name}/report-{stamp}.md"
+    blob_path = f"{run_id}/{model}/{task_name}/{name.format(stamp=stamp)}"
 
     try:
         from azure.storage.blob import BlobServiceClient
 
         client = BlobServiceClient.from_connection_string(connection_string)
-        client.get_blob_client(container, blob_path).upload_blob(report, overwrite=True)
-        log(f"[output] uploaded report to blob {container}/{blob_path}")
+        client.get_blob_client(container, blob_path).upload_blob(data, overwrite=True)
+        log(f"[output] uploaded to blob {container}/{blob_path}")
     except Exception as exc:  # noqa: BLE001 - never let an upload failure fail the job
-        log(f"[warn] failed to upload report to blob storage: {exc}")
+        log(f"[warn] failed to upload {blob_path} to blob storage: {exc}")
+
+
+def upload_report(report: str, task_name: str, task: Task, stamp: str) -> None:
+    upload_blob_text(report, "report-{stamp}.md", task_name, task, stamp)
+
+
+def upload_otel(capture: OtelCapture, task_name: str, task: Task) -> None:
+    """Stop the receiver and upload what it captured. Never raises."""
+    capture.close()
+    if not capture.path.exists() or capture.path.stat().st_size == 0:
+        log("[otel] nothing was captured")
+        return
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    log(f"[otel] captured {capture.path.stat().st_size} bytes")
+    upload_blob_text(capture.path.read_bytes(), "otel-{stamp}.jsonl", task_name, task, stamp)
 
 
 def publish(report: str, task_name: str, task: Task) -> None:
@@ -362,7 +466,13 @@ async def main() -> int:
     log(f"[setup] task={name} skill={task.skill} model={os.environ.get('MODEL') or task.model}")
     cwd, prompt = PREPARE[name]()
 
-    report = await run_task(task, cwd, prompt)
+    capture = start_otel_capture()
+    try:
+        report = await run_task(task, cwd, prompt, capture.env() if capture else None)
+    finally:
+        # Upload telemetry even when the run failed — that is when it matters most.
+        if capture:
+            upload_otel(capture, name, task)
     if not report:
         log("[error] the agent produced no report")
         return 1

@@ -3,24 +3,32 @@
 Reads its configuration from environment variables so the same image can be
 driven by an Azure Container Apps Job, a local `docker run`, or CI.
 
-Two tasks ship with the image, selected with TASK:
+Three tasks ship with the image, selected with TASK:
 
   env-report   (default) A smoke test. One tool call, a few cents at most.
                Confirms the skill is discovered, the agent loop runs, and the
                report reaches stdout.
   code-review  The realistic sample. Clones a repo and reviews a diff range.
                Costs real money — see the cost table in README.md.
+  explain-code Clones a repo and explains what a diff range does and how it
+               works, instead of reviewing it for issues.
 
 Environment variables
 ---------------------
-ANTHROPIC_API_KEY   (required) Anthropic API key.
-TASK                Which task to run.             Default: env-report
-MODEL               Model alias or id.             Default: per-task
-MAX_TURNS           Agent turn cap.                Default: per-task
-OUTPUT_DIR          If set, the report is also written here as review.md.
-SETTING_SOURCES     Comma-separated skill sources. Default: user
+ANTHROPIC_API_KEY       (required) Anthropic API key.
+TASK                    Which task to run.             Default: env-report
+MODEL                   Model alias or id.             Default: per-task
+MAX_TURNS               Agent turn cap.                Default: per-task
+OUTPUT_DIR              If set, the report is also written here as review.md.
+SETTING_SOURCES         Comma-separated skill sources. Default: user
+RUN_ID                  Groups blob uploads from related runs (e.g. a
+                        multi-model comparison). Default: current timestamp.
+STORAGE_CONNECTION_STRING  Azure Storage connection string. If set together
+                        with BLOB_CONTAINER, the report is also uploaded to
+                        blob storage at {RUN_ID}/{MODEL}/{TASK}/report-*.md.
+BLOB_CONTAINER          Blob container name for the upload above.
 
-code-review only:
+code-review and explain-code only:
 TARGET_REPO_URL     Git URL to clone. If unset, WORKSPACE_DIR is reviewed as-is.
 GIT_TOKEN           Optional token injected into an https:// clone URL.
 BASE_REF            Base of the diff range.        Default: origin/HEAD
@@ -78,6 +86,13 @@ TASKS: dict[str, Task] = {
     # permission rule — bash is available, but only for git subcommands.
     "code-review": Task(
         skill="code-review",
+        allowed_tools=["Skill", "Read", "Grep", "Glob", "Bash(git:*)"],
+        model="sonnet",
+        max_turns=40,
+        needs_repo=True,
+    ),
+    "explain-code": Task(
+        skill="explain-code",
         allowed_tools=["Skill", "Read", "Grep", "Glob", "Bash(git:*)"],
         model="sonnet",
         max_turns=40,
@@ -169,8 +184,8 @@ def prepare_env_report() -> tuple[Path, str]:
     return Path("/app"), "Run the container health check and report the result."
 
 
-def prepare_code_review() -> tuple[Path, str]:
-    """Clone the target repo and build the review prompt."""
+def prepare_repo_and_refs() -> tuple[Path, str, str]:
+    """Clone the target repo (if needed) and resolve the diff range."""
     repo = Path(os.environ.get("WORKSPACE_DIR", "/workspace/repo"))
     repo_url = os.environ.get("TARGET_REPO_URL", "").strip()
 
@@ -186,6 +201,12 @@ def prepare_code_review() -> tuple[Path, str]:
 
     base = resolve_base_ref(repo, os.environ.get("BASE_REF", "origin/HEAD").strip() or "origin/HEAD")
     head = os.environ.get("HEAD_REF", "HEAD").strip() or "HEAD"
+    return repo, base, head
+
+
+def prepare_code_review() -> tuple[Path, str]:
+    """Build the review prompt for the resolved diff range."""
+    repo, base, head = prepare_repo_and_refs()
     log(f"[setup] reviewing {base}..{head} in {repo}")
 
     prompt = (
@@ -198,7 +219,31 @@ def prepare_code_review() -> tuple[Path, str]:
     return repo, prompt
 
 
-PREPARE = {"env-report": prepare_env_report, "code-review": prepare_code_review}
+def prepare_explain_code() -> tuple[Path, str]:
+    """Build the explanation prompt for the resolved diff range."""
+    repo, base, head = prepare_repo_and_refs()
+    log(f"[setup] explaining {base}..{head} in {repo}")
+
+    prompt = (
+        f"Explain the changes in this repository between `{base}` and `{head}`.\n"
+        "Use the explain-code skill and follow its report format exactly."
+    )
+    extra = os.environ.get("REVIEW_PROMPT", "").strip()
+    if extra:
+        prompt += f"\n\nAdditional instructions from the operator:\n{extra}"
+    return repo, prompt
+
+
+PREPARE = {
+    "env-report": prepare_env_report,
+    "code-review": prepare_code_review,
+    "explain-code": prepare_explain_code,
+}
+
+
+def resolved_model(task: Task) -> str:
+    """The model this run actually uses: an explicit override, else the task default."""
+    return os.environ.get("MODEL", "").strip() or task.model
 
 
 async def run_task(task: Task, cwd: Path, prompt: str) -> str:
@@ -212,7 +257,7 @@ async def run_task(task: Task, cwd: Path, prompt: str) -> str:
         # Deny anything not pre-approved instead of prompting: there is no TTY
         # here, and a permission prompt would hang the job until it times out.
         permission_mode="dontAsk",
-        model=os.environ.get("MODEL", "").strip() or task.model,
+        model=resolved_model(task),
         max_turns=env_int("MAX_TURNS", task.max_turns),
     )
 
@@ -260,20 +305,47 @@ async def run_task(task: Task, cwd: Path, prompt: str) -> str:
     return (result_text or (transcript[-1] if transcript else "")).strip()
 
 
-def publish(report: str) -> None:
-    """Emit the report to stdout, and to OUTPUT_DIR when one is mounted."""
-    print(report, flush=True)
+def upload_report(report: str, task_name: str, task: Task, stamp: str) -> None:
+    """Upload the report to blob storage, when configured.
 
-    output_dir = os.environ.get("OUTPUT_DIR", "").strip()
-    if not output_dir:
+    Optional: a comparison run across models should still have its other
+    results even if one upload fails, so this logs a warning and returns
+    rather than raising — the report has already reached stdout/OUTPUT_DIR.
+    """
+    connection_string = os.environ.get("STORAGE_CONNECTION_STRING", "").strip()
+    container = os.environ.get("BLOB_CONTAINER", "").strip()
+    if not connection_string or not container:
         return
 
+    run_id = os.environ.get("RUN_ID", "").strip() or stamp
+    model = resolved_model(task)
+    blob_path = f"{run_id}/{model}/{task_name}/report-{stamp}.md"
+
+    try:
+        from azure.storage.blob import BlobServiceClient
+
+        client = BlobServiceClient.from_connection_string(connection_string)
+        client.get_blob_client(container, blob_path).upload_blob(report, overwrite=True)
+        log(f"[output] uploaded report to blob {container}/{blob_path}")
+    except Exception as exc:  # noqa: BLE001 - never let an upload failure fail the job
+        log(f"[warn] failed to upload report to blob storage: {exc}")
+
+
+def publish(report: str, task_name: str, task: Task) -> None:
+    """Emit the report to stdout, to OUTPUT_DIR when mounted, and to blob storage when configured."""
+    print(report, flush=True)
+
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    directory = Path(output_dir)
-    directory.mkdir(parents=True, exist_ok=True)
-    for name in ("report.md", f"report-{stamp}.md"):
-        (directory / name).write_text(report, encoding="utf-8")
-    log(f"[output] wrote report to {directory}")
+
+    output_dir = os.environ.get("OUTPUT_DIR", "").strip()
+    if output_dir:
+        directory = Path(output_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        for name in ("report.md", f"report-{stamp}.md"):
+            (directory / name).write_text(report, encoding="utf-8")
+        log(f"[output] wrote report to {directory}")
+
+    upload_report(report, task_name, task, stamp)
 
 
 async def main() -> int:
@@ -295,7 +367,7 @@ async def main() -> int:
         log("[error] the agent produced no report")
         return 1
 
-    publish(report)
+    publish(report, name, task)
     return 0
 
 

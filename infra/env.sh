@@ -42,6 +42,14 @@ fi
 # Reviews are minutes, not seconds. Give the replica room before it is killed.
 : "${REPLICA_TIMEOUT:=1800}"
 
+# --- Output storage ----------------------------------------------------------
+# Every report is also uploaded to Blob Storage, so results from parallel runs
+# (see run-comparison.sh) land somewhere durable instead of only in job logs.
+# Storage account names are globally unique and limited to 3-24 lowercase
+# alphanumerics, so trim NAME_SUFFIX tighter than the ACR name needs.
+: "${STORAGE_ACCOUNT_NAME:=stagentskill$(echo "${NAME_SUFFIX}" | cut -c1-8)}"
+: "${BLOB_CONTAINER:=reports}"
+
 IMAGE="${ACR_NAME}.azurecr.io/${IMAGE_NAME}:${IMAGE_TAG}"
 
 require_az() {
@@ -68,7 +76,7 @@ require_api_key() {
 # Registering is a one-time, non-destructive, subscription-wide operation —
 # safe to run on every deploy; already-registered namespaces return instantly.
 require_providers() {
-  local providers=(Microsoft.App Microsoft.OperationalInsights Microsoft.ContainerRegistry)
+  local providers=(Microsoft.App Microsoft.OperationalInsights Microsoft.ContainerRegistry Microsoft.Storage)
   local pending=()
 
   for ns in "${providers[@]}"; do

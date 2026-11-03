@@ -39,6 +39,28 @@ az acr build \
 ACR_USERNAME="$(az acr credential show --name "${ACR_NAME}" --query username --output tsv)"
 ACR_PASSWORD="$(az acr credential show --name "${ACR_NAME}" --query 'passwords[0].value' --output tsv)"
 
+echo "==> storage account: ${STORAGE_ACCOUNT_NAME}"
+if ! az storage account show --name "${STORAGE_ACCOUNT_NAME}" --resource-group "${RESOURCE_GROUP}" --output none 2>/dev/null; then
+  az storage account create \
+    --name "${STORAGE_ACCOUNT_NAME}" \
+    --resource-group "${RESOURCE_GROUP}" \
+    --location "${LOCATION}" \
+    --sku Standard_LRS \
+    --output none
+fi
+
+STORAGE_CONNECTION_STRING="$(az storage account show-connection-string \
+  --name "${STORAGE_ACCOUNT_NAME}" \
+  --resource-group "${RESOURCE_GROUP}" \
+  --query connectionString \
+  --output tsv)"
+
+# Idempotent on its own: succeeds whether or not the container already exists.
+az storage container create \
+  --name "${BLOB_CONTAINER}" \
+  --connection-string "${STORAGE_CONNECTION_STRING}" \
+  --output none
+
 echo "==> container apps environment: ${ENVIRONMENT_NAME}"
 if ! az containerapp env show --name "${ENVIRONMENT_NAME}" --resource-group "${RESOURCE_GROUP}" --output none 2>/dev/null; then
   az containerapp env create \
@@ -61,15 +83,18 @@ if az containerapp job show --name "${JOB_NAME}" --resource-group "${RESOURCE_GR
     --output none
 fi
 
-# The API key is stored as a Container Apps secret and the env var only holds a
-# secretref, so it never appears in the job's plaintext configuration.
+# The API key and storage connection string are stored as Container Apps
+# secrets and the env vars only hold secretrefs, so neither appears in the
+# job's plaintext configuration.
 JOB_ENV_VARS=(
   "ANTHROPIC_API_KEY=secretref:anthropic-api-key"
+  "STORAGE_CONNECTION_STRING=secretref:storage-connection-string"
+  "BLOB_CONTAINER=${BLOB_CONTAINER}"
   "TASK=${TASK}"
 )
 # Only set the repo variables for the task that uses them, and only pass MODEL
 # and MAX_TURNS when overridden — otherwise the task's own defaults apply.
-if [[ "${TASK}" == "code-review" ]]; then
+if [[ "${TASK}" == "code-review" || "${TASK}" == "explain-code" ]]; then
   JOB_ENV_VARS+=("TARGET_REPO_URL=${TARGET_REPO_URL}" "BASE_REF=${BASE_REF}" "HEAD_REF=${HEAD_REF}")
 fi
 [[ -n "${MODEL}" ]] && JOB_ENV_VARS+=("MODEL=${MODEL}")
@@ -91,7 +116,7 @@ az containerapp job create \
   --registry-server "${ACR_NAME}.azurecr.io" \
   --registry-username "${ACR_USERNAME}" \
   --registry-password "${ACR_PASSWORD}" \
-  --secrets "anthropic-api-key=${ANTHROPIC_API_KEY}" \
+  --secrets "anthropic-api-key=${ANTHROPIC_API_KEY}" "storage-connection-string=${STORAGE_CONNECTION_STRING}" \
   --env-vars "${JOB_ENV_VARS[@]}" \
   --output none
 
@@ -101,9 +126,11 @@ Deployed.
 
   registry : ${ACR_NAME}.azurecr.io
   image    : ${IMAGE}
+  storage  : ${STORAGE_ACCOUNT_NAME} (container: ${BLOB_CONTAINER})
   job      : ${JOB_NAME}  (manual trigger, task=${TASK})
 
-Run it:    ./infra/run-job.sh
-Tail logs: ./infra/logs.sh
-Tear down: ./infra/cleanup.sh
+Run it:         ./infra/run-job.sh
+Compare models: ./infra/run-comparison.sh
+Tail logs:      ./infra/logs.sh
+Tear down:      ./infra/cleanup.sh
 EOF
